@@ -23,6 +23,20 @@ type recommendRequest struct {
 	Interests []string `json:"interests"`
 }
 
+// gatewayCredential returns the credential to use for this request. Locally
+// that is AI_GATEWAY_API_KEY. On Vercel, each request to the function carries
+// a short-lived OIDC token in the x-vercel-oidc-token header; VERCEL_OIDC_TOKEN
+// is the same token as an environment variable after `vercel env pull`.
+func gatewayCredential(r *http.Request) string {
+	if key := os.Getenv("AI_GATEWAY_API_KEY"); key != "" {
+		return key
+	}
+	if tok := r.Header.Get("x-vercel-oidc-token"); tok != "" {
+		return tok
+	}
+	return os.Getenv("VERCEL_OIDC_TOKEN")
+}
+
 func recommendHandler(agent *Agent) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req recommendRequest
@@ -42,7 +56,14 @@ func recommendHandler(agent *Agent) http.HandlerFunc {
 			return
 		}
 
-		rec, err := agent.Recommend(r.Context(), req.City, req.Days, req.Interests)
+		credential := gatewayCredential(r)
+		if credential == "" {
+			log.Print("no AI Gateway credential: set AI_GATEWAY_API_KEY locally or deploy to Vercel for OIDC")
+			writeError(w, http.StatusInternalServerError, "server is not configured for AI Gateway")
+			return
+		}
+
+		rec, err := agent.Recommend(r.Context(), credential, req.City, req.Days, req.Interests)
 		if err != nil {
 			log.Printf("recommend %q: %v", req.City, err)
 			writeError(w, http.StatusBadGateway, "recommendation agent failed")
@@ -60,10 +81,7 @@ func main() {
 		model = "anthropic/claude-haiku-5.5"
 	}
 
-	agent, err := NewAgent(model)
-	if err != nil {
-		log.Fatal(err)
-	}
+	agent := NewAgent(model)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {

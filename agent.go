@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
@@ -59,29 +58,30 @@ Always call the get_forecast tool first so you can favor indoor activities on we
 Prefer specific, named places over generic advice. Match the traveler's stated interests.
 Return between 3 and 8 recommendations.`
 
-// Agent wraps an AI Gateway client and the model it talks to.
+// Agent wraps an AI Gateway client and the model it talks to. Credentials are
+// supplied per request (see Recommend), because on Vercel the OIDC token is
+// delivered on each incoming request and rotates over time.
 type Agent struct {
 	client openai.Client
 	model  string
 }
 
-// NewAgent builds a client pointed at AI Gateway. On Vercel, VERCEL_OIDC_TOKEN
-// is injected automatically. Locally, set AI_GATEWAY_API_KEY.
-func NewAgent(model string, opts ...option.RequestOption) (*Agent, error) {
-	key := os.Getenv("AI_GATEWAY_API_KEY")
-	if key == "" {
-		key = os.Getenv("VERCEL_OIDC_TOKEN")
-	}
-	if key == "" {
-		return nil, errors.New("set AI_GATEWAY_API_KEY (local) or deploy to Vercel for OIDC")
-	}
-	base := []option.RequestOption{option.WithBaseURL(gatewayBaseURL), option.WithAPIKey(key)}
-	return &Agent{client: openai.NewClient(append(base, opts...)...), model: model}, nil
+// NewAgent builds a client pointed at AI Gateway. Extra options are appended,
+// which lets tests swap the base URL for a fake server.
+func NewAgent(model string, opts ...option.RequestOption) *Agent {
+	base := []option.RequestOption{option.WithBaseURL(gatewayBaseURL)}
+	return &Agent{client: openai.NewClient(append(base, opts...)...), model: model}
 }
 
 // Recommend runs the tool-calling loop: ask the model, execute any tool it
 // requests, feed the result back, and repeat until it returns the final JSON.
-func (a *Agent) Recommend(ctx context.Context, city string, days int, interests []string) (*Recommendation, error) {
+// credential is an AI Gateway API key or a Vercel OIDC token.
+func (a *Agent) Recommend(ctx context.Context, credential, city string, days int, interests []string) (*Recommendation, error) {
+	if credential == "" {
+		return nil, errors.New("no AI Gateway credential")
+	}
+	auth := option.WithAPIKey(credential)
+
 	prompt := fmt.Sprintf("A traveler is spending %d day(s) in %s.", days, city)
 	if len(interests) > 0 {
 		prompt += fmt.Sprintf(" They are interested in: %v.", interests)
@@ -113,7 +113,7 @@ func (a *Agent) Recommend(ctx context.Context, city string, days int, interests 
 
 	const maxSteps = 5
 	for step := 0; step < maxSteps; step++ {
-		completion, err := a.client.Chat.Completions.New(ctx, params)
+		completion, err := a.client.Chat.Completions.New(ctx, params, auth)
 		if err != nil {
 			return nil, fmt.Errorf("ai gateway: %w", err)
 		}

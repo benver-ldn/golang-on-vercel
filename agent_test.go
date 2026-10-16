@@ -39,13 +39,9 @@ func TestRecommendToolLoop(t *testing.T) {
 	}))
 	defer gateway.Close()
 
-	t.Setenv("AI_GATEWAY_API_KEY", "test_key")
-	agent, err := NewAgent("test/model", option.WithBaseURL(gateway.URL))
-	if err != nil {
-		t.Fatal(err)
-	}
+	agent := NewAgent("test/model", option.WithBaseURL(gateway.URL))
 
-	rec, err := agent.Recommend(context.Background(), "Lisbon", 2, []string{"food"})
+	rec, err := agent.Recommend(context.Background(), "test_key", "Lisbon", 2, []string{"food"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,10 +66,26 @@ func TestRecommendToolLoop(t *testing.T) {
 	}
 }
 
-func TestNewAgentRequiresCredentials(t *testing.T) {
+func TestRecommendRequiresCredential(t *testing.T) {
+	agent := NewAgent("m")
+	if _, err := agent.Recommend(context.Background(), "", "Lisbon", 1, nil); err == nil {
+		t.Fatal("expected error without a credential")
+	}
+}
+
+func TestGatewayCredentialPrefersHeaderOverEnvToken(t *testing.T) {
 	t.Setenv("AI_GATEWAY_API_KEY", "")
-	t.Setenv("VERCEL_OIDC_TOKEN", "")
-	if _, err := NewAgent("m"); err == nil {
-		t.Fatal("expected error without credentials")
+	t.Setenv("VERCEL_OIDC_TOKEN", "env_token")
+	r := httptest.NewRequest(http.MethodPost, "/recommendations", nil)
+	if got := gatewayCredential(r); got != "env_token" {
+		t.Fatalf("expected env fallback, got %q", got)
+	}
+	r.Header.Set("x-vercel-oidc-token", "header_token")
+	if got := gatewayCredential(r); got != "header_token" {
+		t.Fatalf("expected header token, got %q", got)
+	}
+	t.Setenv("AI_GATEWAY_API_KEY", "api_key")
+	if got := gatewayCredential(r); got != "api_key" {
+		t.Fatalf("expected API key to win, got %q", got)
 	}
 }
