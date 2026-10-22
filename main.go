@@ -1,21 +1,16 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"log"
 	"net/http"
 	"os"
+	"strings"
+	"time"
 )
-
-func writeJSON(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(v)
-}
-
-func writeError(w http.ResponseWriter, status int, msg string) {
-	writeJSON(w, status, map[string]string{"error": msg})
-}
 
 type recommendRequest struct {
 	City      string   `json:"city"`
@@ -23,50 +18,70 @@ type recommendRequest struct {
 	Interests []string `json:"interests"`
 }
 
-// gatewayCredential returns the credential to use for this request. Locally
-// that is AI_GATEWAY_API_KEY. On Vercel, each request to the function carries
-// a short-lived OIDC token in the x-vercel-oidc-token header; VERCEL_OIDC_TOKEN
-// is the same token as an environment variable after `vercel env pull`.
 func gatewayCredential(r *http.Request) string {
 	if key := os.Getenv("AI_GATEWAY_API_KEY"); key != "" {
 		return key
 	}
-	if tok := r.Header.Get("x-vercel-oidc-token"); tok != "" {
-		return tok
+	if token := r.Header.Get("x-vercel-oidc-token"); token != "" {
+		return token
 	}
 	return os.Getenv("VERCEL_OIDC_TOKEN")
 }
 
-func recommendHandler(agent *Agent) http.HandlerFunc {
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		log.Printf("write response: %v", err)
+	}
+}
+
+func writeError(w http.ResponseWriter, status int, message string) {
+	writeJSON(w, status, map[string]string{"error": message})
+}
+
+func recommendHandler(gateway *Gateway) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
+		defer r.Body.Close()
 		var req recommendRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeError(w, http.StatusBadRequest, "invalid JSON body")
+		dec := json.NewDecoder(r.Body)
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, "expected a JSON object of at most 16 KiB")
 			return
 		}
+		if err := dec.Decode(new(any)); err != io.EOF {
+			writeError(w, http.StatusBadRequest, "expected one JSON object")
+			return
+		}
+		req.City = strings.TrimSpace(req.City)
 		if req.City == "" {
 			writeError(w, http.StatusBadRequest, "city is required")
 			return
 		}
-		if req.Days <= 0 {
+		if req.Days == 0 {
 			req.Days = 3
 		}
-		if req.Days > 14 {
-			writeError(w, http.StatusBadRequest, "days must be 14 or fewer")
+		if req.Days < 1 || req.Days > 14 {
+			writeError(w, http.StatusBadRequest, "days must be between 1 and 14")
 			return
 		}
-
 		credential := gatewayCredential(r)
 		if credential == "" {
-			log.Print("no AI Gateway credential: set AI_GATEWAY_API_KEY locally or deploy to Vercel for OIDC")
 			writeError(w, http.StatusInternalServerError, "server is not configured for AI Gateway")
 			return
 		}
-
-		rec, err := agent.Recommend(r.Context(), credential, req.City, req.Days, req.Interests)
+		ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
+		defer cancel()
+		rec, err := gateway.Recommend(ctx, credential, req)
 		if err != nil {
-			log.Printf("recommend %q: %v", req.City, err)
-			writeError(w, http.StatusBadGateway, "recommendation agent failed")
+			log.Printf("recommend: %v", err)
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				writeError(w, http.StatusGatewayTimeout, "recommendation timed out")
+			} else {
+				writeError(w, http.StatusBadGateway, "recommendation failed")
+			}
 			return
 		}
 		writeJSON(w, http.StatusOK, rec)
@@ -74,25 +89,27 @@ func recommendHandler(agent *Agent) http.HandlerFunc {
 }
 
 func main() {
-	// Model IDs resolve through AI Gateway. List current IDs with:
-	// curl -s https://ai-gateway.vercel.sh/v1/models
 	model := os.Getenv("AI_MODEL")
 	if model == "" {
 		model = "anthropic/claude-haiku-5.5"
 	}
-
-	agent := NewAgent(model)
-
+	gateway := NewGateway(model)
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "model": model})
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
-	mux.HandleFunc("POST /recommendations", recommendHandler(agent))
-
+	mux.HandleFunc("POST /recommendations", recommendHandler(gateway))
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "3000"
 	}
+	server := &http.Server{
+		Addr: ":" + port, Handler: mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
 	log.Printf("listening on :%s", port)
-	log.Fatal(http.ListenAndServe(":"+port, mux))
+	log.Fatal(server.ListenAndServe())
 }
